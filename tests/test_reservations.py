@@ -94,7 +94,38 @@ class ReferenceModel:
         self.promote_scan()
         return 200
 
-    def promote_scan(self) -> None:
+    def reschedule(
+        self,
+        rid: int,
+        original_room: int,
+        original_start: int,
+        original_end: int,
+        target_room: int,
+        target_start: int,
+        target_end: int,
+    ) -> tuple[int, list[int]]:
+        r = self.reservations.get(rid)
+        if r is None:
+            return 404, []
+        if r.status not in ("held", "confirmed"):
+            return 409, []
+        if r.status == "held" and r.expires_at is not None and r.expires_at <= self.now:
+            return 409, []
+        if (
+            r.room != original_room
+            or r.start != original_start
+            or r.end != original_end
+        ):
+            return 409, []
+        if self.overlaps_active(target_room, target_start, target_end, exclude=rid):
+            return 409, []
+        # One atomic move; expires_at is deliberately preserved.
+        r.room, r.start, r.end = target_room, target_start, target_end
+        promoted = self.promote_scan()
+        return 200, promoted
+
+    def promote_scan(self) -> list[int]:
+        promoted: list[int] = []
         waiting = sorted(
             (r for r in self.reservations.values() if r.status == "waiting"),
             key=lambda r: r.id,
@@ -105,6 +136,8 @@ class ReferenceModel:
             ):
                 candidate.status = "held"
                 candidate.expires_at = self.now + self.ttl
+                promoted.append(candidate.id)
+        return promoted
 
     def advance_to(self, target: int) -> set[str]:
         changed = False
@@ -370,3 +403,263 @@ def test_boundary_intervals_and_capacity_per_room(client):
     assert right.status_code == 201
     assert touching.status_code == 202
     assert touching.json()["reservation"]["queue_position"] == 1
+
+
+def reschedule_payload(
+    original_room: int,
+    original_start: int,
+    original_end: int,
+    target_room: int,
+    target_start: int,
+    target_end: int,
+) -> dict[str, Any]:
+    return {
+        "original_room_id": original_room,
+        "original_start_time": original_start,
+        "original_end_time": original_end,
+        "target_room_id": target_room,
+        "target_start_time": target_start,
+        "target_end_time": target_end,
+    }
+
+
+def assert_all_match_ref(http: TestClient, ref: ReferenceModel) -> None:
+    for rid in ref.reservations:
+        assert_matches_ref(http, ref, rid)
+
+
+def test_reschedule_matches_reference_model(client):
+    http, _ = client
+    ref = ReferenceModel(ttl=5)
+
+    def apply(room: int, start: int, end: int) -> int:
+        code, status, rid = ref.apply(room, start, end)
+        response = post_json(http, "/reservations", {"room_id": room, "start_time": start, "end_time": end})
+        assert response.status_code == code
+        assert response.json()["reservation"]["status"] == status
+        return rid
+
+    # Room 1 holds A [10,30) (later confirmed) and B [40,50); a waiter for
+    # each room plus a waiter only fitting room 2's [10,30).
+    rid_a = apply(1, 10, 30)
+    assert ref.confirm(rid_a) == 200
+    assert post_json(http, f"/reservations/{rid_a}/confirm", {}).status_code == 200
+    rid_b = apply(1, 40, 50)
+    rid_w1 = apply(1, 10, 30)   # waiting behind A
+    rid_w2 = apply(2, 10, 30)   # held in room 2
+    rid_w3 = apply(1, 40, 45)   # waiting behind B
+    assert_all_match_ref(http, ref)
+
+    def reschedule(
+        rid: int,
+        o_room: int,
+        o_start: int,
+        o_end: int,
+        t_room: int,
+        t_start: int,
+        t_end: int,
+        key: str | None = None,
+    ):
+        code, promoted = ref.reschedule(
+            rid, o_room, o_start, o_end, t_room, t_start, t_end
+        )
+        response = post_json(
+            http,
+            f"/reservations/{rid}/reschedule",
+            reschedule_payload(o_room, o_start, o_end, t_room, t_start, t_end),
+            key=key,
+        )
+        assert response.status_code == code, response.text
+        if code == 200:
+            assert [item["id"] for item in response.json()["promotions"]] == promoted
+            assert response.json()["reservation"]["id"] == rid
+        return response
+
+    # Move confirmed A room1[10,30) -> room2[10,30): blocked by held w2.
+    reschedule(rid_a, 1, 10, 30, 2, 10, 30)
+    assert_all_match_ref(http, ref)
+
+    # Adjacent half-open intervals never block: A -> room2[30,50).
+    reschedule(rid_a, 1, 10, 30, 2, 30, 50)
+    # Moving A out of room 1 releases exactly [10,30): w1 fits and is promoted.
+    assert ref.reservations[rid_w1].status == "held"
+    assert_all_match_ref(http, ref)
+
+    # Stale original interval is rejected; state and queue unchanged.
+    reschedule(rid_a, 1, 10, 30, 1, 10, 30)
+    reschedule(rid_a, 2, 30, 50, 1, 0, 10)  # 1,0,10) is adjacent to w1 -> fits
+    assert_all_match_ref(http, ref)
+    assert ref.reservations[rid_a].status == "confirmed"
+
+    # Overlapping same-room move for confirmed A [0,10) -> [5,15) must not
+    # double-release capacity: w1 still holds [10,30) and blocks the target.
+    reschedule(rid_a, 1, 0, 10, 1, 5, 15)
+    assert_all_match_ref(http, ref)
+
+    # Same-room move to an adjacent interval succeeds and promotes nobody.
+    reschedule(rid_a, 1, 0, 10, 1, 30, 40)
+    assert_all_match_ref(http, ref)
+
+    # Held B room1[40,50) moves to room2[0,10); w3 fits the released [40,45)
+    # in FIFO order and is promoted with expiry = now + ttl.
+    assert ref.reservations[rid_b].expires_at == 5
+    reschedule(rid_b, 1, 40, 50, 2, 0, 10)
+    assert ref.reservations[rid_b].expires_at == 5
+    assert ref.reservations[rid_w3].status == "held"
+    assert ref.reservations[rid_w3].expires_at == 5
+    assert_all_match_ref(http, ref)
+
+    # Non-active reservations cannot be rescheduled even when the target is free.
+    rid_w4 = apply(1, 10, 20)  # waiting: overlaps promoted w1 [10,30)
+    reschedule(rid_w4, 1, 10, 20, 2, 30, 40)
+    assert_all_match_ref(http, ref)
+
+
+def test_reschedule_expiry_boundary_and_no_hold_extension(client):
+    http, _ = client
+
+    held = post_json(http, "/reservations", {"room_id": 1, "start_time": 10, "end_time": 20})
+    rid = held.json()["reservation"]["id"]
+    assert held.json()["reservation"]["expires_at"] == 5
+
+    # Rescheduling at time 4 keeps the original expiry instant (5): no renewal.
+    post_json(http, "/clock/advance", {"target_time": 4})
+    response = post_json(
+        http,
+        f"/reservations/{rid}/reschedule",
+        reschedule_payload(1, 10, 20, 1, 20, 30),
+    )
+    assert response.status_code == 200
+    assert response.json()["reservation"]["expires_at"] == 5
+    assert response.json()["reservation"]["start_time"] == 20
+
+    # At the exact boundary the hold is expired: the reschedule is rejected
+    # and leaves both the reservation and the waiting queue untouched.
+    waiter = post_json(http, "/reservations", {"room_id": 2, "start_time": 20, "end_time": 30})
+    waiter_id = waiter.json()["reservation"]["id"]
+    post_json(http, "/clock/advance", {"target_time": 5})
+    response = post_json(
+        http,
+        f"/reservations/{rid}/reschedule",
+        reschedule_payload(1, 20, 30, 2, 30, 40),
+    )
+    assert response.status_code == 409
+    assert http.get(f"/reservations/{rid}").json()["status"] == "expired"
+    assert http.get(f"/reservations/{rid}").json()["room_id"] == 1
+    assert http.get(f"/reservations/{waiter_id}").json()["status"] == "held"
+
+    # Confirmed reservations ignore the clock entirely.
+    confirmed = post_json(http, "/reservations", {"room_id": 1, "start_time": 100, "end_time": 200})
+    cid = confirmed.json()["reservation"]["id"]
+    post_json(http, f"/reservations/{cid}/confirm", {})
+    post_json(http, "/clock/advance", {"target_time": 20})
+    response = post_json(
+        http,
+        f"/reservations/{cid}/reschedule",
+        reschedule_payload(1, 100, 200, 2, 100, 200),
+    )
+    assert response.status_code == 200
+    body = response.json()["reservation"]
+    assert body["status"] == "confirmed"
+    assert body["room_id"] == 2
+    assert body["expires_at"] is None
+
+
+def test_reschedule_idempotent_retry_and_payload_change(client):
+    http, _ = client
+    held = post_json(http, "/reservations", {"room_id": 1, "start_time": 10, "end_time": 20})
+    rid = held.json()["reservation"]["id"]
+
+    payload = reschedule_payload(1, 10, 20, 1, 30, 40)
+    key = str(uuid.uuid4())
+    first = http.post(f"/reservations/{rid}/reschedule", json=payload, headers={"Idempotency-Key": key})
+    second = http.post(f"/reservations/{rid}/reschedule", json=payload, headers={"Idempotency-Key": key})
+    changed = http.post(
+        f"/reservations/{rid}/reschedule",
+        json=reschedule_payload(1, 10, 20, 1, 30, 41),
+        headers={"Idempotency-Key": key},
+    )
+    assert first.status_code == 200
+    assert second.status_code == 200
+    assert second.json() == first.json()
+    assert changed.status_code == 409
+
+    # A new reschedule based on the moved reservation works, but replaying the
+    # old key still returns the original stored response.
+    third = post_json(
+        http,
+        f"/reservations/{rid}/reschedule",
+        reschedule_payload(1, 30, 40, 2, 50, 60),
+    )
+    assert third.status_code == 200
+    replay = http.post(f"/reservations/{rid}/reschedule", json=payload, headers={"Idempotency-Key": key})
+    assert replay.status_code == 200
+    assert replay.json() == first.json()
+    current = http.get(f"/reservations/{rid}").json()
+    assert current["room_id"] == 2
+    assert (current["start_time"], current["end_time"]) == (50, 60)
+
+    # A failed reschedule (stale original interval) is also replayed exactly.
+    fail_key = str(uuid.uuid4())
+    fail_payload = reschedule_payload(1, 10, 20, 1, 0, 5)
+    fail_first = http.post(
+        f"/reservations/{rid}/reschedule", json=fail_payload, headers={"Idempotency-Key": fail_key}
+    )
+    fail_retry = http.post(
+        f"/reservations/{rid}/reschedule", json=fail_payload, headers={"Idempotency-Key": fail_key}
+    )
+    assert fail_first.status_code == 409
+    assert fail_retry.status_code == 409
+    assert fail_retry.json() == fail_first.json()
+
+
+def test_two_requests_contend_for_same_reservation(tmp_path):
+    db_path = str(tmp_path / "contend.db")
+    app = create_app(db_path=db_path, room_count=1, hold_ttl=100)
+    barrier = Barrier(2)
+    results: list[tuple[int, Any]] = []
+
+    def move(
+        payload: dict[str, Any],
+        outcomes: list[tuple[int, Any]],
+    ) -> None:
+        local = TestClient(app)
+        barrier.wait()
+        response = local.post(
+            "/reservations/1/reschedule",
+            json=payload,
+            headers={"Idempotency-Key": str(uuid.uuid4())},
+        )
+        outcomes.append((response.status_code, response.json()))
+
+    with TestClient(app) as setup:
+        created = post_json(setup, "/reservations", {"room_id": 1, "start_time": 10, "end_time": 20})
+        rid = created.json()["reservation"]["id"]
+        assert rid == 1
+
+        threads = [
+            Thread(
+                target=move,
+                args=(reschedule_payload(1, 10, 20, 1, 20, 30), results),
+            ),
+            Thread(
+                target=move,
+                args=(reschedule_payload(1, 10, 20, 1, 30, 40), results),
+            ),
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+    assert sorted(code for code, _ in results) == [200, 409]
+    with TestClient(app) as check:
+        body = check.get("/reservations/1").json()
+        assert body["status"] == "held"
+        moved = [(code, data) for code, data in results if code == 200][0][1]
+        assert (body["start_time"], body["end_time"]) == (
+            moved["reservation"]["start_time"],
+            moved["reservation"]["end_time"],
+        )
+        assert body["start_time"] in (20, 30)
+        assert body["end_time"] == body["start_time"] + 10

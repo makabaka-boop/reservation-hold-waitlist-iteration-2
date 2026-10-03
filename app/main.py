@@ -15,6 +15,7 @@ from .services import (
     apply_reservation,
     cancel_reservation,
     confirm_reservation,
+    reschedule_reservation,
     shorten_reservation,
 )
 
@@ -49,6 +50,24 @@ class ShortenRequest(BaseModel, extra="forbid"):
     @classmethod
     def valid_interval(cls, value: int, info: Any) -> int:
         start = info.data.get("start_time")
+        if start is not None and start >= value:
+            raise ValueError("start_time must be before end_time")
+        return value
+
+
+class RescheduleRequest(BaseModel, extra="forbid"):
+    original_room_id: int = Field(ge=1)
+    original_start_time: int = Field(ge=0)
+    original_end_time: int = Field(ge=1)
+    target_room_id: int = Field(ge=1)
+    target_start_time: int = Field(ge=0)
+    target_end_time: int = Field(ge=1)
+
+    @field_validator("original_end_time", "target_end_time")
+    @classmethod
+    def valid_interval(cls, value: int, info: Any) -> int:
+        prefix = info.field_name.removesuffix("_end_time")
+        start = info.data.get(f"{prefix}_start_time")
         if start is not None and start >= value:
             raise ValueError("start_time must be before end_time")
         return value
@@ -214,6 +233,30 @@ def create_app(
             payload.model_dump(),
             lambda conn, now: shorten_reservation(
                 conn, now, reservation_id, payload.start_time, payload.end_time
+            ),
+        )
+
+    @app.post("/reservations/{reservation_id}/reschedule")
+    def post_reschedule(
+        reservation_id: int,
+        request: Request,
+        payload: RescheduleRequest,
+        key: str = Depends(idempotency_key),
+    ) -> JSONResponse:
+        return run_idempotent(
+            request,
+            key,
+            payload.model_dump(),
+            lambda conn, now: reschedule_reservation(
+                conn,
+                now,
+                reservation_id,
+                payload.original_room_id,
+                payload.original_start_time,
+                payload.original_end_time,
+                payload.target_room_id,
+                payload.target_start_time,
+                payload.target_end_time,
             ),
         )
 

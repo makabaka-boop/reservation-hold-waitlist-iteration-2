@@ -114,6 +114,89 @@ def cancel_reservation(
     return 200, {"reservation": reservation, "promotions": promotions}
 
 
+def reschedule_reservation(
+    conn: sqlite3.Connection,
+    now: int,
+    reservation_id: int,
+    original_room_id: int,
+    original_start_time: int,
+    original_end_time: int,
+    target_room_id: int,
+    target_start_time: int,
+    target_end_time: int,
+) -> tuple[int, dict[str, Any]]:
+    """Atomically move a held/confirmed reservation to another room/interval.
+
+    All checks run inside the caller's ``BEGIN IMMEDIATE`` transaction and the
+    waitlist is only touched after every check passes, so any failure leaves
+    both the reservation and the waiting queue unchanged.
+    """
+    row = _reservation_or_404(conn, reservation_id)
+
+    # The current clock is authoritative for the deadline: a held reservation
+    # at or past its expiry makes the request stale. This writes nothing.
+    if (
+        row["status"] == "held"
+        and row["expires_at"] is not None
+        and row["expires_at"] <= now
+    ):
+        raise DomainError(
+            409, "the held reservation has expired, so it cannot be rescheduled"
+        )
+    if row["status"] not in ("held", "confirmed"):
+        raise DomainError(
+            409,
+            "only a held or confirmed reservation can be rescheduled, "
+            f"current status is {row['status']}",
+        )
+
+    # The original room/interval act as the concurrency token: a mismatch means
+    # another request already moved, shortened, canceled or otherwise changed
+    # the reservation.
+    if (
+        row["room_id"] != original_room_id
+        or row["start_time"] != original_start_time
+        or row["end_time"] != original_end_time
+    ):
+        raise DomainError(
+            409,
+            "the supplied original room or interval no longer matches the reservation",
+        )
+
+    _validate_room(conn, target_room_id)
+
+    # Exclude only the reservation being moved; every other held/confirmed
+    # occupation still counts, including overlapping same-room intervals.
+    if db.has_overlap(
+        conn,
+        target_room_id,
+        target_start_time,
+        target_end_time,
+        exclude_id=reservation_id,
+    ):
+        raise DomainError(409, "the target room or interval is not available")
+
+    # A single atomic move. status and expires_at are deliberately untouched:
+    # a held reservation keeps its original deadline (rescheduling cannot
+    # renew it) and a confirmed reservation stays confirmed. The FIFO scan runs
+    # only after the move, so capacity that remains occupied by this
+    # reservation -- notably for overlapping same-room moves -- is never
+    # released, not even transiently within the transaction.
+    conn.execute(
+        """
+        UPDATE reservations
+        SET room_id = ?, start_time = ?, end_time = ?, updated_at = ?
+        WHERE id = ? AND status IN ('held', 'confirmed')
+        """,
+        (target_room_id, target_start_time, target_end_time, now, reservation_id),
+    )
+    reservation = db.serialize_reservation(
+        conn, _reservation_or_404(conn, reservation_id)
+    )
+    promotions = db.promote_waiting(conn, now)
+    return 200, {"reservation": reservation, "promotions": promotions}
+
+
 def shorten_reservation(
     conn: sqlite3.Connection,
     now: int,

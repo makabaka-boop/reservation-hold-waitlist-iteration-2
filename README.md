@@ -73,6 +73,24 @@ curl -X POST http://localhost:8000/reservations/1/shorten \
 
 新区间必须完整位于原区间内，并至少释放一个整数时间单位；该操作随后在同事务中扫描候补。
 
+### 原子改期（换房/改时段）
+
+```bash
+curl -X POST http://localhost:8000/reservations/1/reschedule \
+  -H 'Content-Type: application/json' \
+  -H 'Idempotency-Key: reschedule-1' \
+  -d '{
+    "original_room_id": 1, "original_start_time": 10, "original_end_time": 20,
+    "target_room_id": 2, "target_start_time": 30, "target_end_time": 40
+  }'
+```
+
+- 仅 `held/confirmed` 预约可改期。原房间与原半开区间是并发校验依据：与当前状态不一致（已被另一请求移动、缩短、取消或确认）返回 `409`。
+- 全部检查（按当前时钟判定到期、原状态/原区间、目标房间有效性与目标容量）与移动、候补晋升在**同一个 SQLite `BEGIN IMMEDIATE` 写事务**中完成；目标不可容纳、原状态已变化或请求已过期时，原预约与候补队列均不改变。
+- 容量检查只排除预约自身，其余 `held/confirmed` 占用一律计入，半开区间相邻不冲突。
+- 成功后一次性移动预约，再按现有 FIFO 规则扫描候补；只晋升真正释放出的旧容量（同房间交叠改期中仍被占用的部分不会释放，不产生重复释放）。
+- `held` 保留**原到期时刻**，反复改期不能续期；`confirmed` 改期后仍为 `confirmed`。
+
 ### 推进受控时钟
 
 ```bash
@@ -99,6 +117,7 @@ python3 -m pytest -q
 - 半开区间边界和多房间容量；
 - 保留过期、FIFO 候补、完整区间晋升、不拆分；
 - 缩短/取消释放容量后的同事务晋升；
+- held/confirmed 原子改期：相邻区间、交叠改期不重复释放、到期边界、原区间并发校验、幂等重试与两个请求争用同一预约；
 - 8 个并发冲突申请仅一个取得保留；
 - 幂等重试返回原响应，载荷变化返回 `409`；
 - 关闭并重新创建应用后时钟、保留、候补顺序和晋升结果保持不变；

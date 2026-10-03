@@ -15,6 +15,7 @@ from .services import (
     apply_reservation,
     cancel_reservation,
     confirm_reservation,
+    reschedule_reservation,
     shorten_reservation,
 )
 
@@ -56,6 +57,31 @@ class ShortenRequest(BaseModel, extra="forbid"):
 
 class ClockRequest(BaseModel, extra="forbid"):
     target_time: int = Field(ge=0)
+
+
+class RescheduleRequest(BaseModel, extra="forbid"):
+    original_room_id: int = Field(ge=1)
+    original_start_time: int = Field(ge=0)
+    original_end_time: int = Field(ge=1)
+    target_room_id: int = Field(ge=1)
+    target_start_time: int = Field(ge=0)
+    target_end_time: int = Field(ge=1)
+
+    @field_validator("original_end_time")
+    @classmethod
+    def original_interval_valid(cls, value: int, info: Any) -> int:
+        start = info.data.get("original_start_time")
+        if start is not None and start >= value:
+            raise ValueError("original_start_time must be before original_end_time")
+        return value
+
+    @field_validator("target_end_time")
+    @classmethod
+    def target_interval_valid(cls, value: int, info: Any) -> int:
+        start = info.data.get("target_start_time")
+        if start is not None and start >= value:
+            raise ValueError("target_start_time must be before target_end_time")
+        return value
 
 
 def _configured_int(name: str, default: int, minimum: int, maximum: int | None = None) -> int:
@@ -214,6 +240,30 @@ def create_app(
             payload.model_dump(),
             lambda conn, now: shorten_reservation(
                 conn, now, reservation_id, payload.start_time, payload.end_time
+            ),
+        )
+
+    @app.post("/reservations/{reservation_id}/reschedule")
+    def post_reschedule(
+        reservation_id: int,
+        request: Request,
+        payload: RescheduleRequest,
+        key: str = Depends(idempotency_key),
+    ) -> JSONResponse:
+        return run_idempotent(
+            request,
+            key,
+            payload.model_dump(),
+            lambda conn, now: reschedule_reservation(
+                conn,
+                now,
+                reservation_id,
+                payload.original_room_id,
+                payload.original_start_time,
+                payload.original_end_time,
+                payload.target_room_id,
+                payload.target_start_time,
+                payload.target_end_time,
             ),
         )
 
